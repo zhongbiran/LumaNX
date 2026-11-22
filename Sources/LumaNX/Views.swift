@@ -96,7 +96,7 @@ struct ContentView: View {
                     List(selection:$store.selectedGame) {
                         ForEach(store.games.filter {search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) || $0.id.contains(search)}) { game in
                             HStack(spacing:16) {
-                                GameCover(game:game).frame(width:76,height:76).clipShape(RoundedRectangle(cornerRadius:12)).accessibilityHidden(true)
+                                GameCover(game:game,library:store.libraryURL).frame(width:76,height:76).clipShape(RoundedRectangle(cornerRadius:12)).accessibilityHidden(true)
                                 VStack(alignment:.leading,spacing:8) {
                                     Text(game.name).font(.headline).lineLimit(2)
                                     Text(game.display.isEmpty ? L("版本待识别") : game.display).font(.caption).foregroundStyle(.secondary)
@@ -120,8 +120,12 @@ struct ContentView: View {
 }
 struct GameCover: View {
     let game:Game
+    var library:URL? = nil
     var body:some View {
-        if let path=game.cover,let ns=NSImage(contentsOfFile:path),let cg=ns.cgImage(forProposedRect:nil,context:nil,hints:nil) {
+        let path=game.cover.map { value in
+            value.hasPrefix("/") ? value : library?.appendingPathComponent(value).path ?? value
+        }
+        if let path,let ns=NSImage(contentsOfFile:path),let cg=ns.cgImage(forProposedRect:nil,context:nil,hints:nil) {
             Image(decorative:cg,scale:1).resizable().scaledToFit()
         } else {ZStack{Color.teal.opacity(0.12);Image(systemName:"gamecontroller.fill").font(.system(size:36)).foregroundStyle(.teal)}}
     }
@@ -138,7 +142,7 @@ struct GameDetail: View {
         GlassEffectContainer(spacing:12) {
         VStack(alignment:.leading,spacing:12) {
             HStack(alignment:.top,spacing:12) {
-                GameCover(game:game).frame(width:64,height:64).clipShape(RoundedRectangle(cornerRadius:12)).accessibilityHidden(true)
+                GameCover(game:game,library:store.libraryURL).frame(width:64,height:64).clipShape(RoundedRectangle(cornerRadius:12)).accessibilityHidden(true)
                 VStack(alignment:.leading,spacing:6) {
                     Text(game.name).font(.headline).lineLimit(3).fixedSize(horizontal:false,vertical:true)
                     Text(displayedVersion).font(.callout).foregroundStyle(.secondary)

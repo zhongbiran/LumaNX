@@ -9,7 +9,10 @@ ROOT=Path(__file__).resolve().parents[1]
 sys.path[:0]=[str(ROOT/'Worker'),str(ROOT/'scripts')]
 from bundled_engine import inventory, verify_bundle
 from engine_fixture import make_engine
-from sync_engine import sync, patch_ci_compatibility, patch_sdk_compatibility
+from sync_engine import sync, patch_ci_compatibility, patch_mac_game_icon, patch_sdk_compatibility
+
+MAC_APP_START=('        [NSApplication sharedApplication];\n'
+               '        [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];\n')
 
 
 class EngineSyncTests(unittest.TestCase):
@@ -18,7 +21,7 @@ class EngineSyncTests(unittest.TestCase):
         self.source=make_engine(self.root/'upstream');self.target=self.root/'Engine/nxnative'
         (self.source/'LICENSE').write_text('Synthetic license fixture')
         self.front=self.source/'dm/host/front_mac.m'
-        self.front.write_text('#include "haptics_apple.h"\nK(g.buttonB, DM_BTN_A); K(g.buttonA, DM_BTN_B); K(g.buttonY, DM_BTN_X); K(g.buttonX, DM_BTN_Y);   // by position: right A, bottom B, top X, left Y\n')
+        self.front.write_text('#include "haptics_apple.h"\nK(g.buttonB, DM_BTN_A); K(g.buttonA, DM_BTN_B); K(g.buttonY, DM_BTN_X); K(g.buttonX, DM_BTN_Y);   // by position: right A, bottom B, top X, left Y\n'+MAC_APP_START)
         ios=self.source/'dm/ios/Sources/DmGamepad.m';ios.parent.mkdir(parents=True)
         ios.write_text('#include "haptics_apple.h"\nK(g.buttonB, B_A); K(g.buttonA, B_B); K(g.buttonY, B_X); K(g.buttonX, B_Y);   // by position: right A, bottom B, top X, left Y\n')
         self.git('init','-q');self.commit()
@@ -39,6 +42,11 @@ class EngineSyncTests(unittest.TestCase):
         self.assertEqual(record,verify_bundle(self.target))
         for name in ('dm/host/front_mac.m','dm/ios/Sources/DmGamepad.m'):
             self.assertIn('luma_face_buttons(g)',(self.target/name).read_text())
+        frontend=self.target/'dm/host/front_mac.m'
+        text=frontend.read_text()
+        self.assertGreater(text.index('DM_GAME_ICON'),text.index('setActivationPolicy:'))
+        patch_mac_game_icon(self.target)
+        self.assertEqual(frontend.read_text(),text)
         self.assertFalse((self.target/'untracked.keys').exists())
 
     def test_interface_drift_preserves_previous_snapshot(self):
@@ -51,7 +59,7 @@ class EngineSyncTests(unittest.TestCase):
     def test_shared_face_helper_is_replaced_in_both_frontends(self):
         for name in ('dm/host/front_mac.m', 'dm/ios/Sources/DmGamepad.m'):
             path=self.source/name
-            path.write_text('#include "haptics_apple.h"\nuint64_t m = dm_pad_face(g);   // by position, a Nintendo pad by its labels\n')
+            path.write_text('#include "haptics_apple.h"\nuint64_t m = dm_pad_face(g);   // by position, a Nintendo pad by its labels\n'+(MAC_APP_START if path==self.front else ''))
         self.commit()
         sync(self.source,self.target)
         for name in ('dm/host/front_mac.m', 'dm/ios/Sources/DmGamepad.m'):

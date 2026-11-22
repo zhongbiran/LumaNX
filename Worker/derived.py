@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from core import Failure, atomic, chain_of, digest
 
-REQUIRED = {'derive_profile','provisional_prep','refine_after_rewrite','split_shaders',
+REQUIRED = {'derive_profile','provisional_prep','split_shaders',
             'build_shaders','chain_tables','set_keys','capture_shaders','decode_ue_shaders'}
 TABLES = ('shader_map.tsv','shader_facts.tsv','shader_pairs.tsv')
 PROFILE_STAGE = '生成版本配置'

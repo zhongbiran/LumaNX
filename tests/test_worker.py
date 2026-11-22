@@ -1,4 +1,4 @@
-import contextlib,io,json,os,pathlib,signal,subprocess,sys,tempfile,time,unittest
+import contextlib,io,json,os,pathlib,plistlib,signal,subprocess,sys,tempfile,time,unittest
 from unittest.mock import patch
 ROOT=pathlib.Path(__file__).resolve().parents[1];sys.path.insert(0,str(ROOT/'Worker'))
 from core import *
@@ -113,14 +113,18 @@ class WorkerTests(unittest.TestCase):
             with self.assertRaises(Failure):self.quiet(build.install,self.ctx,root,repo,Profile(),'newkey',root/'dmhost',root/'romfs',root/'modules',root/'shaders',None,root/'font')
         self.assertEqual((gdir/'current/sentinel').read_text(),'working')
 
-    def test_16_shader_progress_counts_complete_pairs(self):
-        repo=self.root/'repo';(repo/'dm/gfx/nvn').mkdir(parents=True);(repo/'dm/gfx/nvn/dmsh_chain.h').write_text('#define DMSH_CHAIN "abc"')
+    def test_16_shader_progress_reads_the_engine_progress_file(self):
+        repo=self.root/'repo'/'engine';(repo/'dm/gfx/nvn').mkdir(parents=True);(repo/'dm/gfx/nvn/dmsh_chain.h').write_text('#define DMSH_CHAIN "abc"')
         d=self.root/'profile';d.mkdir();(d/'shader_map.tsv').write_text('x.bin\t0\t1\tkey1\tdata\nx.bin\t0\t1\tkey2\tdata\n')
         class G:
             def table(self,n):return d/n
-        watch=build.ShaderProgress(G(),repo,self.root/'shaders');watch.path.mkdir(parents=True)
-        (watch.path/'key2_b.json').write_text('{}');self.assertEqual(watch()['done'],0)
-        (watch.path/'key2_b.metallib').write_bytes(b'library');self.assertEqual(watch()['done'],1);self.assertEqual(watch()['total'],2)
+        progress=self.root/'repo'/'shader-progress.json';progress.parent.mkdir(parents=True,exist_ok=True)
+        watch=build.ShaderProgress(G(),repo,self.root/'repo'/'cache')
+        self.assertEqual((watch.progress,watch()['done'],watch()['total']),(progress,0,2))
+        watch.progress.write_text(json.dumps({'step':'cache check','done':2,'total':2,'cached':0}))
+        self.assertEqual(watch()['done'],0)
+        watch.progress.write_text(json.dumps({'step':'compiling','done':1,'total':2,'cached':0}))
+        self.assertEqual((watch()['done'],watch()['total']),(1,2))
 
     def test_17_pipeline_records_use_a_persistent_file(self):
         self.ctx.engine=None # Prepared runtimes must not depend on the selected sources.
@@ -180,6 +184,85 @@ class WorkerTests(unittest.TestCase):
             self.quiet(build.launch,self.ctx)
         self.assertEqual(seen[0]['DM_CONTROLLER_LAYOUTS'],str(self.ctx.private/'controller-layouts.json'))
         self.assertNotIn('DM_INPUT_CONFIG',seen[0])
+
+    def test_launch_uses_only_managed_game_artwork(self):
+        self.ctx.save_catalog({'games':[{'id':'g','packages':[],'cover':'/untrusted/catalog-cover.jpg'}]})
+        self.ctx.r['gameId']='g'
+        game_dir=self.ctx.library/'games/g'
+        (game_dir/'current').mkdir(parents=True)
+        atomic(game_dir/'current/manifest.json',{'hostFeatures':['game-icon-v2']})
+        cover=game_dir/'cover.jpg'
+        outside=self.ctx.private/'outside-cover.jpg'
+        outside.write_bytes(b'outside the library')
+        with patch('toolchain.require_launch_environment'),patch('build.validate_runtime'),patch.object(self.ctx,'run') as run,patch.dict(os.environ,{'DM_GAME_ICON':str(outside)}):
+            self.quiet(build.launch,self.ctx)
+            self.assertNotIn('DM_GAME_ICON',run.call_args.args[2])
+            self.assertEqual(run.call_args.args[0][0],build.game_app_executable(self.ctx,self.ctx.game(),game_dir/'current'))
+            cover.write_bytes(b'managed cover fixture')
+            self.quiet(build.launch,self.ctx)
+            self.assertEqual(run.call_args.args[2]['DM_GAME_ICON'],str(cover))
+            cover.unlink()
+            cover.symlink_to(outside)
+            self.quiet(build.launch,self.ctx)
+            self.assertNotIn('DM_GAME_ICON',run.call_args.args[2])
+
+    def test_launch_uses_game_named_app_bundle_for_switch1_and_switch2(self):
+        cases=(('01002DA013484000','The Legend of Zelda: Skyward Sword HD'),
+               ('010074A01BF12000','Donkey Kong Bananza'))
+        for title_id,name in cases:
+            with self.subTest(title_id=title_id):
+                game={'id':title_id,'name':name,'packages':[]}
+                runtime=self.ctx.library/'games'/title_id/'current'
+                runtime.mkdir(parents=True,exist_ok=True)
+                host=runtime/'dmhost';host.write_bytes(b'host')
+                executable=build.game_app_executable(self.ctx,game,runtime)
+                info=plistlib.loads((executable.parents[1]/'Info.plist').read_bytes())
+                self.assertEqual(info['CFBundleDisplayName'],name)
+                self.assertEqual(info['CFBundleName'],name)
+                self.assertEqual(executable.resolve(),host.resolve())
+                self.assertTrue(executable.is_symlink())
+
+    def test_launch_refreshes_legacy_host_for_managed_game_artwork(self):
+        self.ctx.save_catalog({'games':[{'id':'g','packages':[]}]});self.ctx.r['gameId']='g'
+        runtime=self.ctx.library/'games/g/current';runtime.mkdir(parents=True)
+        cover=runtime.parent/'cover.jpg';cover.write_bytes(b'cover')
+        atomic(runtime/'manifest.json',{'schema':1,'gameId':'g','chain':'fixture','version':'1.0.0'})
+        with patch('toolchain.require_launch_environment'),patch('build.validate_runtime'),patch.object(self.ctx,'run'),patch('build.ensure_game_icon_host',create=True) as update:
+            self.quiet(build.launch,self.ctx)
+        update.assert_called_once_with(self.ctx,self.ctx.game(),runtime,cover)
+
+    def test_icon_refresh_failure_keeps_legacy_game_launchable(self):
+        self.ctx.save_catalog({'games':[{'id':'g','packages':[]}]});self.ctx.r['gameId']='g'
+        runtime=self.ctx.library/'games/g/current';runtime.mkdir(parents=True)
+        cover=runtime.parent/'cover.jpg';cover.write_bytes(b'cover')
+        atomic(runtime/'manifest.json',{'schema':1,'gameId':'g','chain':'fixture','version':'1.0.0'})
+        with patch('toolchain.require_launch_environment'),patch('build.validate_runtime'),patch.object(self.ctx,'run') as run,patch('build.ensure_game_icon_host',side_effect=RuntimeError('unexpected refresh fault')):
+            self.quiet(build.launch,self.ctx)
+        run.assert_called_once()
+        self.assertEqual(self.ctx.job['diagnostics'][-1]['severity'],'warning')
+
+    def test_legacy_host_refresh_changes_only_the_host_and_manifest(self):
+        runtime=self.ctx.library/'games/g/releases/old';runtime.mkdir(parents=True)
+        cover=self.ctx.library/'games/g/cover.jpg';cover.write_bytes(b'cover')
+        host=runtime/'dmhost';host.write_bytes(b'old')
+        shader=runtime/'shaders/game.metallib';shader.parent.mkdir();shader.write_bytes(b'unchanged shader')
+        module=runtime/'modules/main.patched.bin';module.parent.mkdir();module.write_bytes(b'unchanged module')
+        atomic(runtime/'manifest.json',{'schema':1,'gameId':'g','chain':'chain','version':'1.0.0','hostFeatures':['game-icon-v1'],'artifacts':{'files':{'dmhost':[3,'old']}}})
+        source=self.root/'new-dmhost';source.write_bytes(b'new host')
+        class Profile:
+            id='g';
+            def get(self,key):return 'v1'
+            def builds(self):return {'v1':{'display':'1.0.0'}}
+        profile=Profile();root=self.root/'workspace';root.mkdir()
+        with patch('build._icon_host_inputs',return_value=(root,self.root,{},object(),profile)),patch('build.compile_host',return_value=source) as compile_host,patch.object(self.ctx,'run'):
+            self.assertTrue(self.quiet(build.ensure_game_icon_host,self.ctx,{'id':'g'},runtime,cover))
+        self.assertEqual(host.read_bytes(),b'new host')
+        self.assertEqual(shader.read_bytes(),b'unchanged shader')
+        self.assertEqual(module.read_bytes(),b'unchanged module')
+        manifest=read(runtime/'manifest.json')
+        self.assertIn('game-icon-v2',manifest['hostFeatures'])
+        self.assertEqual(manifest['artifacts']['files']['dmhost'],[8,digest(host)])
+        compile_host.assert_called_once()
 
     def test_launcher_and_worker_accept_the_same_switch_language_codes(self):
         source=(ROOT/'Sources/LumaNX/GameLanguage.swift').read_text()

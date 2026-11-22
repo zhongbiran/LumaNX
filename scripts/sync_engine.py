@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Import a pinned public nxnative tree and reapply controller and SDK compatibility patches."""
+"""Import a pinned public nxnative tree and reapply LumaNX compatibility patches."""
 import argparse
 import hashlib
 import json
@@ -45,6 +45,26 @@ def patch_controller(root):
         if old in text or 'dm_pad_face(g)' in text or text.count('luma_face_buttons(g)') != 1:
             raise RuntimeError('Controller patch did not apply cleanly: '+name)
         path.write_text(text)
+
+
+def patch_mac_game_icon(root):
+    path = root/'dm/host/front_mac.m'
+    text = path.read_text()
+    setup = '        [NSApplication sharedApplication];\n'
+    activate = '        [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];\n'
+    icon = '''        const char *icon_path = getenv("DM_GAME_ICON");
+        NSString *icon_file = icon_path ? [NSString stringWithUTF8String:icon_path] : nil;
+        if (icon_file.length) {
+            NSImage *game_icon = [[NSImage alloc] initWithContentsOfFile:icon_file];
+            if (game_icon.isValid) NSApp.applicationIconImage = game_icon;
+        }
+'''
+    patched = setup + activate + icon
+    if text.count(patched) == 1 and text.count('DM_GAME_ICON') == 1:
+        return
+    if text.count(setup + activate) != 1 or 'DM_GAME_ICON' in text:
+        raise RuntimeError('Upstream Mac game icon interface changed: '+str(path))
+    path.write_text(text.replace(setup + activate, patched))
 
 
 def patch_sdk_compatibility(root):
@@ -169,6 +189,7 @@ def sync(checkout, target):
             dest = stage/rel; dest.parent.mkdir(parents=True, exist_ok=True); dest.write_bytes(data)
             if (checkout/rel).stat().st_mode & 0o111: dest.chmod(0o755)
         patch_controller(stage)
+        patch_mac_game_icon(stage)
         patch_sdk_compatibility(stage)
         patch_ci_compatibility(stage)
         record = dict(schema=1, repository=UPSTREAM, revision=sha,

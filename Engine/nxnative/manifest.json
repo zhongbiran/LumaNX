@@ -2373,7 +2373,7 @@
     "dm/host/dm_input.h": "4c7d2c3a5139de2097de1fb9555b36dcf64d0717869ad04397a167f85092bb06",
     "dm/host/entry.S": "950c4115c2a4bc163bbcb5d55f3675f74a0a3effd5fc9c9727618e7078be0fac",
     "dm/host/front.h": "de94f33586be91779596b394c56ac441c18b54d568636eb20a5533988499f0c6",
-    "dm/host/front_mac.m": "8e2615684c39a967d9ea1efab5403626b866ee412baff9bb3ed448856b29e737",
+    "dm/host/front_mac.m": "fd30857b3d7816d5a4d18201e98e2fb2763f1af49414ebf9875169fea78aaf59",
     "dm/host/front_role.h": "0892980e570ae97aba9d50c028fc1c223f873bd794ae80bf04c6dd8d9ba7d799",
     "dm/host/haptics_apple.h": "f384991c7371f53299755672351a9f9be89f28e1a600eb5dddeec127fc548a42",
     "dm/host/haptics_apple.m": "a7fa33712ab44b1614fbf2fce3e57bbe37a24ba98946e85ee53f18eafbb52b58",
