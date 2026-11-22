@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from core import Failure, atomic, chain_of, digest
 
-REQUIRED = {'derive_profile','provisional_prep','refine_after_rewrite','split_shaders',
+REQUIRED = {'derive_profile','provisional_prep','split_shaders',
             'build_shaders','chain_tables','set_keys','capture_shaders','decode_ue_shaders'}
 TABLES = ('shader_map.tsv','shader_facts.tsv','shader_pairs.tsv')
 PROFILE_STAGE = '生成版本配置'
@@ -152,8 +152,9 @@ def shaders(c,st,up,repo,root,env,gp,selected,patched,dirs,sources,target):
 
 
 def validate_tables(cache,gp,chain):
-    lib=Path(cache)/('b-'+chain)
+    from shader_artifacts import library_view
     try:
+        lib=library_view(cache,chain)
         stamp=dict(line.split('\t',1) for line in (lib/'inputs.tsv').read_text().splitlines() if '\t' in line and not line.startswith('#'))
         if stamp.get('game')!=gp.id or not stamp.get('inputs') or stamp['inputs']=='none': raise ValueError('inputs')
         head=f"# chain b-{chain} inputs {stamp['inputs']} "

@@ -1600,6 +1600,12 @@ void front_run(void (*guest)(void)) {
     @autoreleasepool {
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+        const char *icon_path = getenv("DM_GAME_ICON");
+        NSString *icon_file = icon_path ? [NSString stringWithUTF8String:icon_path] : nil;
+        if (icon_file.length) {
+            NSImage *game_icon = [[NSImage alloc] initWithContentsOfFile:icon_file];
+            if (game_icon.isValid) NSApp.applicationIconImage = game_icon;
+        }
         NSRect r = NSMakeRect(0, 0, 1280, 720);
         NSWindow *win = [[NSWindow alloc] initWithContentRect:r
                                                     styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable

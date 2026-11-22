@@ -1,25 +1,30 @@
 """Build macOS runtime files directly using supported game profiles."""
 from __future__ import annotations
-import contextlib, importlib.util, json, os, re, shutil, subprocess, sys, time
+import contextlib, importlib.util, json, os, plistlib, re, shutil, subprocess, sys, time
 from pathlib import Path
 from inspect import signature
 from core import *
 from library import requirements, inspect
 import milestones as ms
+from shader_artifacts import generate_tables, validate_library
 
 class ShaderProgress:
-    """Count only finished reflection/library pairs; do not infer progress from queue order."""
+    """Count the shaders the engine finished; it reports them in the file it writes.
+
+    The engine stages finished shaders in its cache database and leaves only the
+    ones in flight on disk, so the folder cannot tell what is done.
+    """
     def __init__(self,g,repo,cache):
         self.keys=set()
         for line in g.table('shader_map.tsv').read_text().splitlines():
             columns=line.split('\t')
             if len(columns)>4 and (columns[0].endswith('.bin') or columns[0].startswith('main.rodata@')):self.keys.add(columns[3])
-        chain=chain_of(repo,g)
-        self.path=Path(cache)/('b-'+chain)
+        self.progress=Path(repo).parent/'shader-progress.json'
     def __call__(self):
-        names=set(os.listdir(self.path)) if self.path.is_dir() else set()
-        done=sum(k+'_b.json' in names and k+'_b.metallib' in names for k in self.keys)
-        return {'done':done,'total':len(self.keys),'unit':'shaders','step':'编译并验证 Metal 库'}
+        try: p=json.loads(self.progress.read_text())
+        except (OSError,ValueError): p={}
+        if p.get('step')!='compiling': return {'done':0,'total':len(self.keys),'unit':'shaders','step':'编译并验证 Metal 库'}
+        return {'done':p.get('done',0),'total':p.get('total',len(self.keys)),'unit':'shaders','step':'编译并验证 Metal 库'}
 
 class Stages:
     def __init__(self,c,root,graph=None,legacy=None):
@@ -219,6 +224,7 @@ def prepare(c,g,target='macos'):
                 c.emit(message=st.step,done=st.done,total=None if st.est else st.total,unit=st.unit)
         def say(self,msg): c.emit('message',msg)
     up.PROG=Bridge(); up.run=container_runner(c,g)
+    env['DMSH_PROGRESS']=str(root/'shader-progress.json')   # the engine counts the shaders it finishes here
     return root,repo,env,up,gp,key
 
 def compile_host(c,up,repo,env,root,gp):
@@ -246,7 +252,7 @@ def install(c,root,repo,gp,key,host,romfs,modules,shader,aoc=None,font=None):
         validate_tables(shader,gp,chain)
         for name in ('c1_full.tsv','cb_extent.tsv'): clone(gp.table(name),stage/'profile'/name)
     elif gp.get('graphics','nvn') not in ('vulkan','gl'):
-        c.run([sys.executable,Path(__file__).parent/'c1_generate.py',repo/'dm/gfx/tools/c1_guard.py',stage/'shaders'/('b-'+chain),stage/'profile/c1_full.tsv'],root/'logs/c1.log',c.env(gp.id,root))
+        generate_tables(c,repo,stage/'shaders'/('b-'+chain),lambda name:stage/'profile'/name,root/'logs/c1.log',c.env(gp.id,root))
         if not (stage/'profile/c1_full.tsv').read_text().startswith('# chain b-'+chain+' '): raise Failure('着色器常量表版本不一致。')
     if font: cp(font,'font')
     else:
@@ -255,7 +261,7 @@ def install(c,root,repo,gp,key,host,romfs,modules,shader,aoc=None,font=None):
         if not fontpath: raise Failure('找不到本机系统字体。')
         clone(fontpath,stage/'font/standard.ttf')
         c.run([sys.executable,repo/'dm/tools/make_ext_font.py',stage/'font/nintendo_ext.ttf'],root/'logs/font.log',c.env(gp.id,root))
-    manifest={'schema':1,'gameId':gp.id,'engine':read(root/'identity.json',{}).get('tools',{}).get('engine','external'),'cacheKey':key,'sourceHashes':read(root/'identity.json',{}).get('sources',[]),'chain':chain,'graphics':gp.get('graphics','nvn'),'version':gp.builds()[gp.get('package')]['display'],'inputConfig':read(root/'identity.json',{}).get('tools',{}).get('inputConfig',False),'created':time.time(),'preparationMode':'derived' if own else 'registered','pipeline':read(root/'identity.json',{}).get('pipeline')}
+    manifest={'schema':1,'gameId':gp.id,'engine':read(root/'identity.json',{}).get('tools',{}).get('engine','external'),'cacheKey':key,'sourceHashes':read(root/'identity.json',{}).get('sources',[]),'chain':chain,'graphics':gp.get('graphics','nvn'),'version':gp.builds()[gp.get('package')]['display'],'inputConfig':read(root/'identity.json',{}).get('tools',{}).get('inputConfig',False),'created':time.time(),'preparationMode':'derived' if own else 'registered','pipeline':read(root/'identity.json',{}).get('pipeline'),'hostFeatures':['game-icon-v2']}
     from incremental import runtime_inventory
     manifest['artifacts']=runtime_inventory(c,stage)
     atomic(stage/'manifest.json',manifest)
@@ -295,11 +301,7 @@ def validate_runtime(path,gp=None):
             from types import SimpleNamespace
             from derived import validate_tables
             validate_tables(path/'shaders',SimpleNamespace(id=m['gameId'],table=lambda name:path/'profile'/name),m['chain'])
-        b=path/'shaders'/('b-'+m['chain']); reflected=list(b.glob('*_b.json'))
-        if not reflected: raise Failure('Metal 着色器缓存缺失。')
-        for p in reflected:
-            r=read(p,{})
-            if r.get('chain')!=m['chain'] or not p.with_suffix('.metallib').is_file(): raise Failure('Metal 着色器缓存不完整或版本不一致。')
+        validate_library(path/'shaders',m['chain'])
 
 def build(c,target='macos'):
     with c.lock('execution'), contextlib.ExitStack() as cleanup:
@@ -325,9 +327,6 @@ def build(c,target='macos'):
         needed=max(sum(x['size'] for x in sources),g.get('sourceExpandedSize',0))*2+(10 if target=='ios' else 3)*2**30
         if shutil.disk_usage(c.library).free<needed and not st.saved: raise Failure(f'准备游戏需要约 {needed/2**30:.0f} GB 可用空间。')
         dirs={}
-        # Recent upstream requires the selected application for multi-app
-        # containers; older development engines keep the nine-argument API.
-        extraction={'app':int(g['id'],16)} if 'app' in signature(up.extract).parameters else {}
         for index,ver in enumerate(versions):
             upd=next((c.library/x['path'] for x in g['packages'] if x['type']=='update' and f"v{x['version']}"==ver),None)
             d=root/'extract'/ver; dirs[ver]=d
@@ -337,7 +336,7 @@ def build(c,target='macos'):
                 import nup
                 st.run('解包与合并 '+ver,[d],lambda d=d,ver=ver:nup.extract(c,c.library/sources[0]['path'],int(ver[1:]),d),milestone=f'unpack-{index}')
             else:
-                st.run('解包与合并 '+ver,[d],lambda ver=ver,upd=upd: up.extract(c.nx(),c.keys,root/'extract',ver,c.library/base['path'],upd,None,logs,gp,**extraction),milestone=f'unpack-{index}')
+                st.run('解包与合并 '+ver,[d],lambda ver=ver,upd=upd: up.extract(c.nx(),c.keys,root/'extract',ver,c.library/base['path'],upd,logs,int(g['id'],16),repo),milestone=f'unpack-{index}')
         if own:
             import derived
             gp,sources_info=derived.prepare_profile(c,st,up,gp,root,repo,env,dirs[strategy['version']],strategy['version'])
@@ -353,7 +352,7 @@ def build(c,target='macos'):
         patched=root/('patched_'+gp.get('package')); selected=dirs[gp.get('package')]
         st.run('重写原生代码',[patched],lambda:up.rewrite(sys.executable,repo,selected/'ExeFS',patched,env,logs,gp),milestone='rewrite')
         if own:
-            gp=up.refine_after_rewrite(gp,selected,patched);derived.seal_profile(st,gp)
+            derived.seal_profile(st,gp)
             if st.graph: st.graph.profile=gp
             sh=derived.shaders(c,st,up,repo,root,env,gp,selected,patched,dirs,sources_info,target)
         else:
@@ -378,9 +377,27 @@ def build(c,target='macos'):
                 oodle=oodle_decoder(up,repo,root,env,gp,patched,sources_info)
                 # Keep the old split API for external engines without decoder support.
                 decoder={'oodle':oodle} if oodle else {}
+                installed_dlc=dlc_sources(aoc)
                 if 'dlc_roms' in signature(up.split_shaders).parameters:
-                    decoder['dlc_roms']=dlc_sources(aoc)
+                    decoder['dlc_roms']=installed_dlc
+                # The split scans the installed DLC, so its tables carry the DLC's rows and the comparison with the registered ones fails. The engine's rule for that case: a DLC-only difference derives a shader-only profile, which keeps the registered module builds and settings.
+                if installed_dlc and 'derive_dlc' in signature(up.split_shaders).parameters:
+                    def derive_shader_tables():
+                        nonlocal gp
+                        from derived import module
+                        up.nacp=module(str(repo/'dm/tools/nacp.py'),'lumanx_nacp')
+                        if getattr(up,'pg',None) is None: up.pg=module(str(repo/'dm/games/profile_guess.py'),'lumanx_profile_guess')
+                        folder=root/'profiles'/gp.id
+                        up.derive_profile(gp,folder,gp.get('package'),selected,gp.words('modules'),None,True)
+                        gp=type(gp)(folder)
+                        return gp
+                    decoder['derive_dlc']=derive_shader_tables
+                    if not (root/'profiles'/gp.id).is_dir(): st.saved.pop('提取并核对着色器',None)   # the derived profile holds the DLC's tables: without it the split has to run again
                 st.run('提取并核对着色器',[sh/'pkg'],lambda:up.split_shaders(sys.executable,repo,[romfs_source(d) for d in dirs.values()]+[d/'glslc_capture' for d in dirs.values() if (d/'glslc_capture').exists()],[d/'ExeFS/main' for d in dirs.values()],sh/'pkg',env,logs,gp,**decoder),milestone='extract')
+                derived_profile=root/'profiles'/gp.id
+                if derived_profile.is_dir():   # the derived profile holds the DLC's tables: the build reads the profile from there
+                    env.update(DM_GAMES_DIR=os.pathsep.join([str(derived_profile.parent),env.get('DM_GAMES_DIR','')]),DM_GAMES_FIRST='1')
+                    if gp.dir!=derived_profile: gp=type(gp)(derived_profile)
                 def shaders():
                     up.PROG.stage('iOS shaders' if target=='ios' else 'Mac shaders',poll=ShaderProgress(gp,repo,sh/'ios' if target=='ios' else sh/'cache'))
                     try: c.run([sys.executable,repo/'dm/gfx/tools/dmsh_build.py',sh/'pkg',sh/'cache'],logs/'dmsh_build.log',dict(env,IOSOUT=str(sh/'ios')) if target=='ios' else env)
@@ -455,6 +472,130 @@ def migrate(c):
 # nn::settings::LanguageCode values; no arbitrary host locale or UI language tags.
 GAME_LANGUAGES=frozenset(('ja','en-US','fr','de','it','es','zh-CN','ko','nl','pt','ru','zh-TW','en-GB','fr-CA','es-419','zh-Hans','zh-Hant','pt-BR'))
 
+def _icon_host_inputs(c,g,runtime,manifest):
+    """Load the verified build workspace that produced this runtime."""
+    runtime=contained(c.library,Path(runtime).resolve())
+    game_cache=contained(c.library,c.library/'cache'/g['id'])
+    marker=read(game_cache/'workspace-macos.json',{})
+    name=marker.get('directory')
+    if marker.get('schema')!=1 or not isinstance(name,str) or Path(name).name!=name or name in ('.','..'):
+        raise Failure('找不到此游戏对应的准备记录，无法安全地只更新图标组件。')
+    root=contained(game_cache,game_cache/name)
+    identity=read(root/'identity.json',{})
+    if (not root.is_dir() or root.is_symlink() or identity.get('game')!=g['id'] or identity.get('target')!='macos'
+            or identity.get('tools',{}).get('engineSource')!=(root/'engine/.source-ready').read_text().strip()):
+        raise Failure('游戏准备记录与运行版本不匹配，无法安全地只更新图标组件。')
+    repo=root/'engine'
+    previous=c.private/'engines'/manifest.get('engine','')/'source'
+    ready=read(previous.parent/'ready.json',{})
+    if not previous.is_dir() or ready.get('fingerprint')!=manifest.get('engine'):
+        raise Failure('找不到原运行版本对应的引擎源码，无法安全更新宿主。')
+    from engine import source_files, source_hash
+    if source_hash(previous)!=ready.get('snapshotHash'):
+        raise Failure('原运行版本的引擎源码校验失败，未改动当前游戏。')
+    old={p.relative_to(previous).as_posix():digest(p) for p in source_files(previous)}
+    new={p.relative_to(repo).as_posix():digest(p) for p in source_files(repo)}
+    changed={name for name in old.keys()|new.keys() if old.get(name)!=new.get(name)}
+    allowed={'dm/host/front_mac.m','dm/gfx/nvn/dmsh_chain.h','dm/gfx/tools/dmsh_chain.lock'}
+    setup='        [NSApplication sharedApplication];\n'
+    activate='        [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];\n'
+    icon='''        const char *icon_path = getenv("DM_GAME_ICON");
+        NSString *icon_file = icon_path ? [NSString stringWithUTF8String:icon_path] : nil;
+        if (icon_file.length) {
+            NSImage *game_icon = [[NSImage alloc] initWithContentsOfFile:icon_file];
+            if (game_icon.isValid) NSApp.applicationIconImage = game_icon;
+        }
+'''
+    old_front=(previous/'dm/host/front_mac.m').read_text()
+    expected_before=old_front.replace(setup+activate,setup+icon+activate,1)
+    expected_after=old_front.replace(setup+activate,setup+activate+icon,1)
+    front=repo/'dm/host/front_mac.m';new_front=front.read_text()
+    if (changed-allowed or old_front.count(setup+activate)!=1
+            or new_front not in (expected_before,expected_after)):
+        raise Failure('引擎版本除 Dock 图标补丁外还有其他变化；为保护游戏兼容性，请重新准备游戏。')
+    if new_front==expected_before:
+        front.write_text(expected_after)
+    if chain_of(repo)!=manifest.get('chain'):
+        raise Failure('当前准备目录的着色器链与已安装游戏不同，未改动当前游戏。')
+    game_spec=importlib.util.spec_from_file_location('lumanx_icon_host_game',repo/'dm/games/game.py')
+    game_module=importlib.util.module_from_spec(game_spec);game_spec.loader.exec_module(game_module)
+    game_module.HERE=repo/'dm/games'
+    gp=game_module.load(g['id'])
+    strategy=identity.get('preparation',{})
+    if strategy.get('mode')=='derived':
+        derived=root/'profiles'/g['id']
+        if not derived.is_dir(): raise Failure('找不到游戏使用的派生版本配置。')
+        gp=type(gp)(derived)
+    elif strategy.get('mode')=='registered' and strategy.get('version')!=gp.get('package'):
+        from derived import select_registered
+        gp=select_registered(gp,strategy['version'])
+    display=gp.builds().get(gp.get('package'),{}).get('display')
+    if display!=manifest.get('version'):
+        raise Failure('当前游戏版本与准备目录不一致，未改动当前游戏。')
+    env=c.env(g['id'],root);env['MACOSX_DEPLOYMENT_TARGET']='26.0';env['J']=str(min(os.cpu_count() or 4,8))
+    spec=importlib.util.spec_from_file_location('lumanx_icon_host_engine',repo/'scripts/build_ipa_from_nsp.py')
+    up=importlib.util.module_from_spec(spec);spec.loader.exec_module(up)
+    (root/'logs').mkdir(exist_ok=True)
+    return root,repo,env,up,gp
+
+
+def ensure_game_icon_host(c,g,runtime,cover):
+    """Refresh only dmhost for an older installed runtime; game shaders are untouched."""
+    runtime=contained(c.library,Path(runtime).resolve())
+    cover=contained(c.library,Path(cover).resolve())
+    manifest=read(runtime/'manifest.json',{})
+    if 'game-icon-v2' in manifest.get('hostFeatures',[]): return False
+    c.begin('检查游戏运行版本',1,2)
+    root,repo,env,up,gp=_icon_host_inputs(c,g,runtime,manifest)
+    c.begin('只更新游戏图标组件',2,2)
+    host=compile_host(c,up,repo,env,root,gp)
+    candidate=runtime/'dmhost.icon.partial'
+    try:
+        clone(host,candidate,c.progress);os.chmod(candidate,0o755)
+        c.run(['codesign','--verify','--strict',candidate],root/'logs/icon-host-verify.log',env)
+        c.check()
+        os.replace(candidate,runtime/'dmhost')
+        manifest['hostFeatures']=['game-icon-v2']
+        files=manifest.setdefault('artifacts',{}).setdefault('files',{})
+        binary=runtime/'dmhost';files['dmhost']=[binary.stat().st_size,digest(binary)]
+        atomic(runtime/'manifest.json',manifest)
+    finally:
+        candidate.unlink(missing_ok=True)
+    return True
+
+
+def game_app_executable(c,g,runtime):
+    """Give AppKit a per-game bundle name while keeping the managed host binary."""
+    identifier=re.sub(r'[^A-Za-z0-9.-]','-',str(g.get('id') or 'game')).strip('-.').lower() or 'game'
+    name=str(g.get('name') or g.get('id') or 'Nintendo Switch game').strip()
+    if not name: name=str(g.get('id') or 'Nintendo Switch game')
+    bundle=c.private/'game-apps'/f'{identifier}.app'
+    contents=bundle/'Contents';macos=contents/'MacOS'
+    macos.mkdir(parents=True,exist_ok=True)
+    executable=macos/'LumaNXGame'
+    target=Path(runtime)/'dmhost'
+    if executable.is_symlink() and executable.resolve()==target.resolve(): pass
+    else:
+        executable.unlink(missing_ok=True)
+        temporary=macos/'LumaNXGame.partial'
+        temporary.unlink(missing_ok=True)
+        temporary.symlink_to(target)
+        os.replace(temporary,executable)
+    info={
+        'CFBundleExecutable':'LumaNXGame',
+        'CFBundleIdentifier':f'com.lumanx.game.{identifier}',
+        'CFBundleName':name,
+        'CFBundleDisplayName':name,
+        'CFBundlePackageType':'APPL',
+        'CFBundleVersion':'1',
+        'NSHighResolutionCapable':True,
+    }
+    payload=plistlib.dumps(info,fmt=plistlib.FMT_XML)
+    plist=contents/'Info.plist';temporary=contents/'Info.plist.partial'
+    temporary.write_bytes(payload);os.replace(temporary,plist)
+    return executable
+
+
 def launch(c):
     language=c.r.get('gameLanguage','zh-Hans')
     if not isinstance(language,str) or language not in GAME_LANGUAGES:
@@ -463,6 +604,16 @@ def launch(c):
     require_launch_environment(c)
     with c.lock('execution'):
         g=c.game(); runtime=c.library/'games'/g['id']/'current'; validate_runtime(runtime)
+        cover=None
+        with contextlib.suppress(Failure,OSError,RuntimeError):
+            candidate=contained(c.library,runtime.parent/'cover.jpg')
+            if candidate.is_file(): cover=candidate
+        if cover and 'game-icon-v2' not in read(runtime/'manifest.json',{}).get('hostFeatures',[]):
+            try: ensure_game_icon_host(c,g,runtime,cover)
+            except Cancelled: raise
+            except Exception as error:
+                import diagnostics
+                c.report(diagnostics.make(c,'game_icon_refresh_failed','游戏图标更新失败，继续使用旧运行文件。','查看本任务阶段和日志；图标更新不会重编译游戏着色器。',detail=str(error),log=c.last_log,severity='warning'))
         c.begin('游戏运行中',1,1)
         save=c.library/'saves'/g['id']; temp=c.library/'temp'/g['id']; pso=c.library/'games'/g['id']/'pso_user/pipelines.tsv'
         for p in (save,temp,pso.parent): p.mkdir(parents=True,exist_ok=True)
@@ -478,8 +629,10 @@ def launch(c):
         # Always override inherited state; native controller policy is independent
         # of the optional keyboard/mouse mapping interface. Missing file = labels.
         env['DM_CONTROLLER_LAYOUTS']=str(c.private/'controller-layouts.json')
+        # Artwork is optional and must come from the current library.
+        if cover: env['DM_GAME_ICON']=str(cover)
         log=c.private/'logs'/f'game-{g["id"]}.log'
-        try: c.run([runtime/'dmhost',runtime/'modules'],log,env,cwd=temp)
+        try: c.run([game_app_executable(c,g,runtime),runtime/'modules'],log,env,cwd=temp)
         except Failure as error:
             with log.open('rb') as f:
                 f.seek(max(0,log.stat().st_size-16384)); tail=f.read().decode(errors='replace')

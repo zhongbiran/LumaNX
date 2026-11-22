@@ -1,5 +1,6 @@
 """Chain header guard regression for the issue #9 follow-up; synthetic files only."""
 from pathlib import Path
+import json
 import os
 import shutil
 import subprocess
@@ -121,11 +122,9 @@ class ChainHeaderTests(unittest.TestCase):
                 self.assertEqual(chain_of(repo,gp),'b0')
                 self.assertEqual((repo/HEADER).exists(),not legacy)
                 watch=build.ShaderProgress(gp,repo,work/'shader/cache')
-                self.assertEqual(watch.path,work/'shader/cache/b-b0')
-                watch.path.mkdir(parents=True)
-                (watch.path/'key_b.json').write_text('{}')
-                self.assertEqual(watch()['done'],0)
-                (watch.path/'key_b.metallib').write_text('synthetic')
+                self.assertEqual(watch.progress,work/'shader-progress.json')
+                watch.progress.parent.mkdir(parents=True,exist_ok=True)
+                watch.progress.write_text(json.dumps({'step':'compiling','done':1,'total':1}))
                 self.assertEqual(watch()['done'],1)
                 ios=work/'shader/ios/b-b0'; ios.mkdir(parents=True)
                 (ios/'key_b.json').write_text('{"chain":"b0","chain_metal":"iphoneos"}')
